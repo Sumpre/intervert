@@ -1,16 +1,106 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Discord Control Panel</title>
-    <style>
-        body { font-family: sans-serif; background-color: #36393f; color: #ffffff; text-align: center; padding-top: 50px; }
-        .login-button { background-color: #5865f2; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-size: 18px; }
-    </style>
-</head>
-<body>
-    <h1>Welcome to the Control Panel</h1>
-    <p>Please log in with Discord to continue.</p>
-    <br>
-    <a href="https://discord.com/api/oauth2/authorize?client_id={{ client_id }}&redirect_uri={{ redirect_uri }}&response_type=code&scope={{ scopes }}" class="login-button">Login with Discord</a>
-</body>
-</html>
+from flask import Flask, request, render_template, session, redirect, url_for
+import discord
+from discord.ext import commands
+import requests
+import os
+import threading
+
+# --- CONFIGURAZIONE ---
+# Le prendiamo tutte dalle Environment Variables di Render
+CLIENT_ID = os.environ['CLIENT_ID']
+CLIENT_SECRET = os.environ['CLIENT_SECRET']
+REDIRECT_URI = os.environ['REDIRECT_URI']
+SECRET_KEY = os.environ['SECRET_KEY']
+BOT_TOKEN = os.environ['BOT_TOKEN'] # NUOVA VARIABILE: Il token del BOT, non il secret!
+
+API_BASE_URL = 'https://discord.com/api/v10'
+# AGGIUNGIAMO 'applications.commands' AGLI SCOPES!
+SCOPES = ['identify', 'guilds', 'webhook.incoming', 'applications.commands']
+
+# --- PARTE FLASK (SITO WEB PER IL LOGIN) ---
+flask_app = Flask(__name__)
+flask_app.secret_key = SECRET_KEY
+
+@flask_app.route('/')
+def index():
+    if 'user_id' in session:
+        return "<h1>Sei loggato!</h1><p>Ora puoi usare i comandi dell'app direttamente dentro Discord.</p>"
+    else:
+        return render_template('index.html', client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, scopes=' '.join(SCOPES))
+
+@flask_app.route('/callback')
+def callback():
+    code = request.args.get('code')
+    data = {
+        'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET, 'grant_type': 'authorization_code',
+        'code': code, 'redirect_uri': REDIRECT_URI
+    }
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    r = requests.post(f'{API_BASE_URL}/oauth2/token', data=data, headers=headers)
+    if r.status_code != 200: return "Errore durante l'autenticazione."
+    
+    token_data = r.json()
+    session['access_token'] = token_data['access_token']
+    
+    user_headers = {'Authorization': f"Bearer {session['access_token']}"}
+    user_r = requests.get(f'{API_BASE_URL}/users/@me', headers=user_headers)
+    user_info = user_r.json()
+    session['user_id'] = user_info['id']
+    session['username'] = user_info['username']
+    
+    # In un'app reale, salveresti l'access_token in un database legato allo user_id.
+    # Per ora, la sessione è sufficiente per una prova.
+    
+    return redirect(url_for('index'))
+
+# --- PARTE DISCORD BOT (PER GESTIRE I COMANDI) ---
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f'Bot {bot.user} è online e pronto.')
+    # Sincronizza i comandi con Discord
+    await bot.tree.sync()
+    print("Comandi slash sincronizzati.")
+
+# QUESTO È IL NOSTRO PRIMO COMANDO SLASH
+@bot.tree.command(name="raid", description="Invia un messaggio di raid in un canale.")
+async def raid_command(interaction: discord.Interaction, messaggio: str, quantita: int):
+    # Messaggio di conferma solo per l'utente
+    await interaction.response.send_message(f"Inizio il raid nel canale {interaction.channel.name}...", ephemeral=True)
+    
+    # Qui dovremmo prendere l'access token dell'utente dal nostro database/sessione.
+    # Poiché il bot e il sito sono separati, questo è il punto complesso.
+    # Per ora, simuliamo la creazione di un webhook usando il TOKEN DEL BOT.
+    # In un'app completa, useresti l'access_token dell'utente.
+    
+    try:
+        webhook = await interaction.channel.create_webhook(name="System Alert")
+    except discord.Forbidden:
+        await interaction.followup.send("Errore: Non ho il permesso di creare un webhook in questo canale.", ephemeral=True)
+        return
+
+    # Spam attraverso il webhook
+    for i in range(quantita):
+        await webhook.send(content=messaggio)
+    
+    # Cancella il webhook
+    await webhook.delete()
+    
+    await interaction.followup.send("Raid completato.", ephemeral=True)
+
+# --- AVVIO COMBINATO ---
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=8080)
+
+def run_bot():
+    bot.run(BOT_TOKEN)
+
+if __name__ == '__main__':
+    # Avviamo il server Flask in un thread separato
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    
+    # Avviamo il bot Discord
+    run_bot()
