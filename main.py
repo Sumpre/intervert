@@ -7,8 +7,8 @@ app = Flask(__name__)
 # --- CONFIGURAZIONE ---
 # Ora prendiamo tutto dagli "Environment Variables" di Render per la massima sicurezza e flessibilità.
 try:
-    CLIENT_ID = os.environ['1386998628136124466']
-    CLIENT_SECRET = os.environ['O-MDlWj4kOxTKqBuMdU_Pc6qw7Gg7LDB']
+    CLIENT_ID = os.environ['CLIENT_ID']
+    CLIENT_SECRET = os.environ['CLIENT_SECRET']
     # L'URL di redirect ora viene impostato direttamente su Render.
     REDIRECT_URI = os.environ['REDIRECT_URI']
     # La chiave segreta per la sessione, anch'essa una variabile d'ambiente.
