@@ -1,46 +1,50 @@
 from flask import Flask, request, render_template, session, redirect, url_for
+import discord
+from discord import app_commands
+from discord.ext import commands
 import requests
 import os
-
-app = Flask(__name__)
+import threading
 
 # --- CONFIGURAZIONE ---
-# Ora prendiamo tutto dagli "Environment Variables" di Render per la massima sicurezza e flessibilità.
+# Leggiamo tutte le 6 variabili d'ambiente che hai impostato su Render.
 try:
     CLIENT_ID = os.environ['CLIENT_ID']
     CLIENT_SECRET = os.environ['CLIENT_SECRET']
-    # L'URL di redirect ora viene impostato direttamente su Render.
     REDIRECT_URI = os.environ['REDIRECT_URI']
-    # La chiave segreta per la sessione, anch'essa una variabile d'ambiente.
-    app.secret_key = os.environ['SECRET_KEY']
+    SECRET_KEY = os.environ['SECRET_KEY']
+    BOT_TOKEN = os.environ['BOT_TOKEN']
+    # L'ID del tuo server di test. Lo convertiamo in un numero intero.
+    GUILD_ID = int(os.environ['GUILD_ID'])
 except KeyError as e:
-    # Se manca una variabile, questo messaggio apparirà nei log di Render.
-    print(f"!!! ERRORE: Manca la Environment Variable '{e.args[0]}'")
-    # È meglio non far partire l'app se la configurazione è incompleta.
+    # Se una variabile manca, questo errore apparirà nei log di Render.
+    print(f"!!! ERRORE CRITICO: Manca la Environment Variable '{e.args[0]}'. Il programma si fermerà.")
     exit()
 
 API_BASE_URL = 'https://discord.com/api/v10'
-SCOPES = ['identify', 'guilds', 'webhook.incoming']
+# Assicurati che gli "scopes" (permessi) includano 'applications.commands'.
+SCOPES = ['identify', 'guilds', 'webhook.incoming', 'applications.commands']
 
-@app.route('/')
+
+# --- PARTE 1: SITO WEB (FLASK) PER GESTIRE IL LOGIN ---
+# Rinominiamo la nostra app Flask per chiarezza.
+flask_app = Flask(__name__)
+flask_app.secret_key = SECRET_KEY
+
+@flask_app.route('/')
 def index():
-    # Se l'utente ha già fatto il login, gli mostriamo un pannello di controllo (per ora semplice).
-    if 'user_id' in session:
-        # Qui in futuro aggiungeremo i campi per spammare, ecc.
-        return f"""
-            <h1>Pannello di Controllo</h1>
-            <p>Benvenuto, {session.get('username', 'user')}. Sei pronto.</p>
-            <p>Server di cui fai parte: (qui mostreremo la lista)</p>
-        """
+    if 'access_token' in session:
+        return "<h1>Loggato con successo!</h1><p>Ora puoi usare i comandi slash dell'applicazione direttamente dentro Discord.</p>"
     else:
-        # Se non ha fatto il login, gli mostriamo il pulsante per farlo.
-        # Ora usiamo il file index.html come dovrebbe essere.
+        # Passiamo le variabili al template per costruire il link di login.
         return render_template('index.html', client_id=CLIENT_ID, redirect_uri=REDIRECT_URI, scopes=' '.join(SCOPES))
 
-@app.route('/callback')
+@flask_app.route('/callback')
 def callback():
+    # Discord ci rimanda qui dopo che l'utente ha autorizzato l'app.
     code = request.args.get('code')
     
+    # Scambiamo il codice temporaneo per un "access token" permanente.
     data = {
         'client_id': CLIENT_ID,
         'client_secret': CLIENT_SECRET,
@@ -49,23 +53,81 @@ def callback():
         'redirect_uri': REDIRECT_URI
     }
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
     r = requests.post(f'{API_BASE_URL}/oauth2/token', data=data, headers=headers)
     
-    if r.status_code != 200:
-        return "Errore durante l'autenticazione con Discord. Prova di nuovo."
-        
-    token_data = r.json()
-    user_headers = {'Authorization': f"Bearer {token_data['access_token']}"}
-    user_r = requests.get(f'{API_BASE_URL}/users/@me', headers=user_headers)
-    user_info = user_r.json()
-
-    # Salviamo le informazioni importanti nella sessione dell'utente.
-    session['user_id'] = user_info['id']
-    session['username'] = user_info['username']
-    session['access_token'] = token_data['access_token']
+    # Salviamo l'access token nella sessione dell'utente.
+    # In un'app reale, questo verrebbe salvato in un database.
+    session['access_token'] = r.json()['access_token']
     
     return redirect(url_for('index'))
 
-# NOTA: La parte "app.run(...)" è stata rimossa perché Render usa Gunicorn
-# per avviare il server, quindi non è più necessaria.
+
+# --- PARTE 2: BOT DISCORD PER GESTIRE I COMANDI SLASH ---
+# Creiamo una classe per il nostro bot per una migliore organizzazione.
+class MyBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        # Questo è l'albero che conterrà i nostri comandi.
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        # Questo metodo viene chiamato quando il bot si avvia.
+        # Registra i comandi solo sul nostro server di test per vederli subito.
+        test_guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=test_guild)
+        await self.tree.sync(guild=test_guild)
+        print(f"Comandi slash sincronizzati con successo sul server {GUILD_ID}.")
+
+bot = MyBot()
+
+@bot.event
+async def on_ready():
+    print(f"Bot {bot.user} è online e pronto a ricevere comandi.")
+
+# Definiamo il nostro primo comando slash.
+@bot.tree.command(name="raid", description="Invia un certo numero di messaggi in un canale.")
+@app_commands.describe(
+    messaggio="Il testo da spammare.",
+    quantita="Il numero di volte che il messaggio verrà inviato."
+)
+async def raid_command(interaction: discord.Interaction, messaggio: str, quantita: int):
+    # Rispondiamo all'utente con un messaggio che solo lui può vedere.
+    await interaction.response.send_message(f"Comando ricevuto! Inizio il raid nel canale {interaction.channel.name}...", ephemeral=True)
+    
+    try:
+        # Creiamo un webhook per mandare messaggi anonimi.
+        webhook = await interaction.channel.create_webhook(name="System Message")
+    except discord.Forbidden:
+        # Se il bot non ha i permessi, lo diciamo all'utente.
+        await interaction.followup.send("ERRORE: Non ho il permesso di creare webhook in questo canale.", ephemeral=True)
+        return
+
+    # Eseguiamo lo spam.
+    for _ in range(quantita):
+        await webhook.send(messaggio)
+    
+    # Cancelliamo il webhook per non lasciare tracce.
+    await webhook.delete()
+    
+    # Diciamo all'utente che abbiamo finito.
+    await interaction.followup.send("Raid completato con successo.", ephemeral=True)
+
+
+# --- PARTE 3: AVVIO COMBINATO DEL SITO E DEL BOT ---
+def run_bot_in_thread():
+    # Questa funzione fa partire il bot.
+    bot.run(BOT_TOKEN)
+
+if __name__ == '__main__':
+    # Creiamo un "thread" separato per far girare il bot in background.
+    bot_thread = threading.Thread(target=run_bot_in_thread)
+    bot_thread.start()
+    
+    # Esponiamo l'app Flask per Gunicorn.
+    # Gunicorn cercherà una variabile chiamata 'app' in questo file.
+    # Il nostro start command su Render è `gunicorn main:flask_app`
+    # quindi questo alias non è strettamente necessario, ma è una buona pratica.
+    app = flask_app 
+    
+    # NOTA: Gunicorn si occuperà di far partire 'flask_app'. 
+    # Non abbiamo bisogno di 'flask_app.run()' qui.
